@@ -2925,8 +2925,10 @@ EOLA
     chmod 644 "${menubar_launch_agent_plist}"
 
     # Load for the currently logged-in user if someone is at the console.
+    # Use scutil (official Apple API) rather than the deprecated stat /dev/console approach.
     local console_user uid
-    console_user=$(stat -f '%Su' /dev/console 2>/dev/null)
+    console_user=$(scutil <<< "show State:/Users/ConsoleUser" \
+        | awk '/Name :/ && !/loginwindow/ { print $3 }')
     uid=$(id -u "${console_user}" 2>/dev/null)
     if [[ -n "${uid}" && "${uid}" != "0" ]]; then
         launchctl bootout "gui/${uid}/${menubar_launch_agent_label}" 2>/dev/null || true
@@ -2957,7 +2959,8 @@ function uninstall_app_auto_patch() {
     if [[ -f "${menubar_launch_agent_plist}" ]]; then
         log_uninstall "MenuBar: removing LaunchAgent ${menubar_launch_agent_plist}"
         local console_user uid
-        console_user=$(stat -f '%Su' /dev/console 2>/dev/null)
+        console_user=$(scutil <<< "show State:/Users/ConsoleUser" \
+            | awk '/Name :/ && !/loginwindow/ { print $3 }')
         uid=$(id -u "${console_user}" 2>/dev/null)
         [[ -n "${uid}" && "${uid}" != "0" ]] && \
             launchctl bootout "gui/${uid}/${menubar_launch_agent_label}" 2>/dev/null || true
@@ -3970,8 +3973,11 @@ launch_menubar_app() {
         return
     fi
 
-    local console_user uid
-    console_user=$(stat -f '%Su' /dev/console 2>/dev/null)
+    # currentUserAccountName is set by get_logged_in_user() which runs before this
+    # function is ever called (it is only invoked from main(), after workflow_startup()).
+    local console_user="${currentUserAccountName}"
+    [[ -z "${console_user}" || "${console_user}" == "FALSE" ]] && return
+    local uid
     uid=$(id -u "${console_user}" 2>/dev/null)
     [[ -z "${uid}" || "${uid}" == "0" ]] && return
 
@@ -3982,11 +3988,11 @@ launch_menubar_app() {
 
     log_info "MenuBar: launching companion app for ${console_user} (uid ${uid})"
     # Prefer kickstarting the installed LaunchAgent (it's already loaded after install).
-    # Fall back to a direct spawn if the LaunchAgent isn't loaded yet.
+    # Fall back to a direct spawn if the LaunchAgent isn't loaded yet (unsupported path).
     if launchctl kickstart -k "gui/${uid}/${menubar_launch_agent_label}" 2>/dev/null; then
         log_info "MenuBar: LaunchAgent kickstarted successfully"
     else
-        log_info "MenuBar: LaunchAgent not loaded – spawning directly via launchctl asuser"
+        log_warning "MenuBar: LaunchAgent not yet loaded; using launchctl asuser as fallback (unsupported by Apple – ensure LaunchAgent plist is installed for reliable operation)"
         launchctl asuser "${uid}" "${menubar_app_binary}" &
         disown
     fi
