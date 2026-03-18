@@ -2080,6 +2080,12 @@ workflow_startup() {
 	log_aap "**** App Auto-Patch ${scriptVersion} - AAP STARTUP WORKFLOW ****"
 	write_status "Running: Startup workflow."
 
+    # Reset any stale menu bar state from a previous run so the icon stays hidden
+    # until discovery is complete and updates are confirmed.
+    if [[ "${MenuBarMode}" == "TRUE" ]] && [[ -f "${menubar_state_file}" ]]; then
+        write_menubar_state "idle" "0" ""
+    fi
+
     get_logged_in_user
     # Computer stats here
     log_info "Computer Serial: $serialNumber"
@@ -2751,6 +2757,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.title         = state.pendingUpdateCount > 0 ? " \(state.pendingUpdateCount)" : ""
             statusItem.isVisible = true
             rebuildMenu(state: state)
+        case "hard_deadline":
+            let cfg   = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+            let image = NSImage(systemSymbolName: "exclamationmark.circle.fill",
+                                accessibilityDescription: "Install required")
+            button.image         = image?.withSymbolConfiguration(cfg)
+            button.imagePosition = .imageLeading
+            button.title         = " Install required"
+            statusItem.isVisible = true
+            rebuildMenu(state: state)
         case "patching_in_progress":
             let cfg   = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
             let image = NSImage(systemSymbolName: "gearshape.fill",
@@ -2801,6 +2816,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 title: "Defer Until Tomorrow", action: #selector(handleDeferTomorrow), keyEquivalent: "")
             deferDay.target = self
             menu.addItem(deferDay)
+        case "hard_deadline":
+            let count = state.pendingUpdateCount
+            let header = NSMenuItem(
+                title: "\(count) update\(count == 1 ? "" : "s") will install shortly",
+                action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            for app in state.pendingApps.prefix(6) {
+                let item = NSMenuItem(title: "  \u{2022} \(app)", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
+            }
+            if state.pendingApps.count > 6 {
+                let more = NSMenuItem(
+                    title: "  \u{2026} and \(state.pendingApps.count - 6) more",
+                    action: nil, keyEquivalent: "")
+                more.isEnabled = false
+                menu.addItem(more)
+            }
+            menu.addItem(.separator())
+            let notice = NSMenuItem(
+                title: "No deferrals remaining \u{2014} install is automatic",
+                action: nil, keyEquivalent: "")
+            notice.isEnabled = false
+            menu.addItem(notice)
         case "patching_in_progress":
             let item = NSMenuItem(title: "Patching in progress\u{2026}", action: nil, keyEquivalent: "")
             item.isEnabled = false
@@ -3937,13 +3977,20 @@ launch_menubar_app() {
 
     if pgrep -x "AAPMenuBar" > /dev/null 2>&1; then
         log_info "MenuBar: companion app already running"
-    else
-        log_info "MenuBar: launching companion app as ${console_user}"
-        launchctl asuser "${uid}" sudo -u "${console_user}" \
-            "${menubar_app_binary}" &
-        disown
-        sleep 1
+        return
     fi
+
+    log_info "MenuBar: launching companion app for ${console_user} (uid ${uid})"
+    # Prefer kickstarting the installed LaunchAgent (it's already loaded after install).
+    # Fall back to a direct spawn if the LaunchAgent isn't loaded yet.
+    if launchctl kickstart -k "gui/${uid}/${menubar_launch_agent_label}" 2>/dev/null; then
+        log_info "MenuBar: LaunchAgent kickstarted successfully"
+    else
+        log_info "MenuBar: LaunchAgent not loaded – spawning directly via launchctl asuser"
+        launchctl asuser "${uid}" "${menubar_app_binary}" &
+        disown
+    fi
+    sleep 1
 }
 
 # wait_for_menubar_command
@@ -5479,6 +5526,12 @@ main() {
             rm -f "${WORKFLOW_INSTALL_NOW_FILE}" 2> /dev/null
             rm -f "${WORKFLOW_INSTALL_NOW_SILENT_FILE}" 2> /dev/null
             log_info "Install Now Workflow or Silent Mode active - Bypassing deferral workflow"
+            # Inform the menu bar companion that patching is starting immediately
+            if [[ "${MenuBarMode}" == "TRUE" ]]; then
+                write_menubar_state "patching_in_progress" "${numberOfUpdates}" \
+                    "$(printf '%b' "${menubar_display_names}")"
+                launch_menubar_app
+            fi
             log_notice "Passing ${numberOfUpdates} labels to Installomator: $queuedLabelsArray"
             workflow_do_Installations
             
@@ -5522,7 +5575,18 @@ main() {
             
             if [[ "${deadline_days_status}" == "HARD" ]] || [[ "${deadline_count_status}" == "HARD" ]]; then # The Max number of deferrals have been used
                 log_notice "Max number of deferrals have been used, display dialog and countdown to install workflow"
-                dialog_install_hard_deadline
+                if [[ "${MenuBarMode}" == "TRUE" ]]; then
+                    # Show hard-deadline warning in the menu bar instead of a popup dialog.
+                    # The Swift companion will display a warning icon; we then sleep for the
+                    # same DialogTimeoutDeferral countdown before proceeding automatically.
+                    write_menubar_state "hard_deadline" "${numberOfUpdates}" \
+                        "$(printf '%b' "${menubar_display_names}")"
+                    launch_menubar_app
+                    log_info "MenuBar: hard deadline – waiting ${DialogTimeoutDeferral:-60}s countdown before auto-install"
+                    sleep "${DialogTimeoutDeferral:-60}"
+                else
+                    dialog_install_hard_deadline
+                fi
                 log_info "Passing ${numberOfUpdates} labels to Installomator: $queuedLabelsArray"
                 workflow_do_Installations
                 defaults write "${appAutoPatchLocalPLIST}" AAPPatchingCompletionStatus -bool true #Set completion status to true

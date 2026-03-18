@@ -15,7 +15,13 @@ import Foundation
 // ---------------------------------------------------------------------------
 
 struct AAPState: Codable {
-    var status: String           // "idle" | "pending_updates" | "patching_in_progress" | "up_to_date"
+    // Possible status values:
+    //   "idle"                 – no pending updates; icon hidden
+    //   "pending_updates"      – updates discovered, awaiting user decision
+    //   "hard_deadline"        – max deferrals exceeded; install will start automatically
+    //   "patching_in_progress" – Installomator is running
+    //   "up_to_date"           – patching complete or nothing to do; icon hidden
+    var status: String
     var pendingUpdateCount: Int
     var pendingApps: [String]
     var lastPatchedDate: String?
@@ -113,6 +119,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.isVisible = true
             rebuildMenu(state: state)
 
+        case "hard_deadline":
+            // Max deferrals exhausted — warn the user; install will start automatically.
+            let cfg   = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+            let image = NSImage(systemSymbolName: "exclamationmark.circle.fill",
+                                accessibilityDescription: "Install required – no deferrals remaining")
+            button.image         = image?.withSymbolConfiguration(cfg)
+            button.imagePosition = .imageLeading
+            button.title         = " Install required"
+            statusItem.isVisible = true
+            rebuildMenu(state: state)
+
         case "patching_in_progress":
             let cfg   = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
             let image = NSImage(systemSymbolName: "gearshape.fill",
@@ -180,6 +197,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 title: "Defer Until Tomorrow", action: #selector(handleDeferTomorrow), keyEquivalent: "")
             deferDay.target = self
             menu.addItem(deferDay)
+
+        case "hard_deadline":
+            // No deferral options – install will begin automatically after the countdown.
+            let count = state.pendingUpdateCount
+            let header = NSMenuItem(
+                title: "\(count) update\(count == 1 ? "" : "s") will install shortly",
+                action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+
+            for app in state.pendingApps.prefix(6) {
+                let item = NSMenuItem(title: "  • \(app)", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
+            }
+            if state.pendingApps.count > 6 {
+                let more = NSMenuItem(
+                    title: "  … and \(state.pendingApps.count - 6) more",
+                    action: nil, keyEquivalent: "")
+                more.isEnabled = false
+                menu.addItem(more)
+            }
+
+            menu.addItem(.separator())
+            let notice = NSMenuItem(
+                title: "No deferrals remaining — install is automatic",
+                action: nil, keyEquivalent: "")
+            notice.isEnabled = false
+            menu.addItem(notice)
 
         case "patching_in_progress":
             let item = NSMenuItem(title: "Patching in progress…", action: nil, keyEquivalent: "")
