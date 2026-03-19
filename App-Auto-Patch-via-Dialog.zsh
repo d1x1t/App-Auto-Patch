@@ -2693,7 +2693,7 @@ install_menubar_app() {
     /bin/cat > "${swift_src}" << 'SWIFT_SOURCE'
 // AAPMenuBar.swift – embedded build copy; edit AAPMenuBar/AAPMenuBar.swift in the repo
 import Cocoa
-import Foundation
+import SwiftUI
 
 struct AAPState: Codable {
     var status: String
@@ -2701,20 +2701,285 @@ struct AAPState: Codable {
     var pendingApps: [String]
     var lastPatchedDate: String?
     var nextRunDate: String?
+    var stateUpdatedEpoch: TimeInterval?
+    var countdownSeconds: Int?
+}
+
+class AAPStateModel: ObservableObject {
+    let stateFilePath = "/Library/Management/AppAutoPatch/menubar-state.json"
+    let cmdFilePath   = "/var/tmp/aap-menubar.cmd"
+    @Published var state: AAPState = AAPState(
+        status: "idle", pendingUpdateCount: 0, pendingApps: [],
+        lastPatchedDate: nil, nextRunDate: nil,
+        stateUpdatedEpoch: nil, countdownSeconds: nil)
+    func reload() {
+        guard let data = FileManager.default.contents(atPath: stateFilePath),
+              let loaded = try? JSONDecoder().decode(AAPState.self, from: data) else { return }
+        DispatchQueue.main.async { self.state = loaded }
+    }
+    func writeCommand(_ cmd: String) {
+        try? cmd.write(toFile: cmdFilePath, atomically: true, encoding: .utf8)
+    }
+}
+
+struct AAPPopoverView: View {
+    @ObservedObject var appState: AAPStateModel
+    var onDismiss: () -> Void
+    @State private var secondsRemaining: Int = 0
+    @State private var countdownTimer: Timer? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            headerSection
+            if !appState.state.pendingApps.isEmpty { appListSection }
+            Divider().padding(.vertical, 8)
+            actionSection
+            Divider().padding(.vertical, 8)
+            footerSection
+        }
+        .padding(16)
+        .frame(width: 300)
+        .onAppear { appState.reload(); startCountdownIfNeeded() }
+        .onDisappear { stopCountdown() }
+    }
+
+    @ViewBuilder
+    private var headerSection: some View {
+        HStack(spacing: 10) {
+            Image(systemName: headerIconName)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundColor(headerIconColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headerTitle).font(.system(size: 14, weight: .semibold))
+                if !headerSubtitle.isEmpty {
+                    Text(headerSubtitle).font(.system(size: 11)).foregroundColor(.secondary)
+                }
+            }
+            Spacer()
+        }
+        .padding(.bottom, 10)
+    }
+
+    private var headerIconName: String {
+        switch appState.state.status {
+        case "hard_deadline":        return "exclamationmark.circle.fill"
+        case "patching_in_progress": return "gearshape.fill"
+        case "up_to_date":           return "checkmark.circle.fill"
+        default:                     return "arrow.triangle.2.circlepath.circle.fill"
+        }
+    }
+    private var headerIconColor: Color {
+        switch appState.state.status {
+        case "hard_deadline":        return .red
+        case "patching_in_progress": return .blue
+        case "up_to_date":           return .green
+        default:                     return .orange
+        }
+    }
+    private var headerTitle: String {
+        let n = appState.state.pendingUpdateCount
+        switch appState.state.status {
+        case "hard_deadline":        return "\(n) update\(n == 1 ? "" : "s") will install soon"
+        case "patching_in_progress": return "Patching in progress\u{2026}"
+        case "up_to_date":           return "All apps are up to date"
+        default:                     return "\(n) app update\(n == 1 ? "" : "s") available"
+        }
+    }
+    private var headerSubtitle: String {
+        switch appState.state.status {
+        case "hard_deadline":        return "Maximum deferrals reached"
+        case "patching_in_progress": return "Please don\u{2019}t restart your Mac"
+        default:                     return ""
+        }
+    }
+
+    @ViewBuilder
+    private var appListSection: some View {
+        let apps = appState.state.pendingApps
+        let displayed = Array(apps.prefix(8))
+        let overflow  = apps.count - displayed.count
+        VStack(alignment: .leading, spacing: 4) {
+            FlowLayout(spacing: 6) {
+                ForEach(displayed, id: \.self) { app in
+                    Text(app)
+                        .font(.system(size: 11))
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(5)
+                        .overlay(RoundedRectangle(cornerRadius: 5)
+                            .stroke(Color(NSColor.separatorColor), lineWidth: 0.5))
+                }
+            }
+            if overflow > 0 {
+                Text("\u{2026} and \(overflow) more")
+                    .font(.system(size: 11)).foregroundColor(.secondary).padding(.top, 2)
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    @ViewBuilder
+    private var actionSection: some View {
+        switch appState.state.status {
+        case "hard_deadline":        hardDeadlineActions
+        case "patching_in_progress": patchingActions
+        default:                     normalActions
+        }
+    }
+
+    @ViewBuilder
+    private var normalActions: some View {
+        Button(action: { appState.writeCommand("install_now"); onDismiss() }) {
+            HStack {
+                Image(systemName: "arrow.down.circle.fill")
+                Text("Update Now").fontWeight(.semibold)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(ProminentGreenButtonStyle())
+        .padding(.bottom, 8)
+        HStack(spacing: 8) {
+            Text("Defer:").font(.system(size: 12)).foregroundColor(.secondary)
+            Button("1 Hour")         { appState.writeCommand("defer:60");   onDismiss() }
+                .buttonStyle(SecondaryButtonStyle())
+            Button("Until Tomorrow") { appState.writeCommand("defer:1440"); onDismiss() }
+                .buttonStyle(SecondaryButtonStyle())
+        }
+    }
+
+    @ViewBuilder
+    private var hardDeadlineActions: some View {
+        HStack {
+            Image(systemName: "timer").foregroundColor(.red)
+            Text(secondsRemaining > 0
+                 ? "Installing in \(formattedCountdown)\u{2026}"
+                 : "Installing now\u{2026}")
+                .font(.system(size: 13, weight: .medium)).foregroundColor(.red)
+            Spacer()
+        }
+        .padding(.vertical, 4)
+        Text("No deferrals remaining. Installation will begin automatically.")
+            .font(.system(size: 11)).foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private var patchingActions: some View {
+        HStack {
+            ProgressView().scaleEffect(0.7).padding(.trailing, 4)
+            Text("Installation in progress\u{2026}")
+                .font(.system(size: 12)).foregroundColor(.secondary)
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    private var footerSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let v = appState.state.lastPatchedDate, !v.isEmpty { footerRow("Last patched:", v) }
+            if let v = appState.state.nextRunDate,     !v.isEmpty { footerRow("Next run:",     v) }
+        }
+    }
+    private func footerRow(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 4) {
+            Text(label).font(.system(size: 11)).foregroundColor(.secondary).frame(width: 90, alignment: .leading)
+            Text(value).font(.system(size: 11))
+        }
+    }
+
+    private var formattedCountdown: String {
+        let m = secondsRemaining / 60; let s = secondsRemaining % 60
+        return m > 0 ? String(format: "%d:%02d", m, s) : "\(s)s"
+    }
+    private func startCountdownIfNeeded() {
+        stopCountdown()
+        guard appState.state.status == "hard_deadline",
+              let epoch = appState.state.stateUpdatedEpoch,
+              let total = appState.state.countdownSeconds else { return }
+        let remaining = Int(epoch + Double(total) - Date().timeIntervalSince1970)
+        secondsRemaining = max(remaining, 0)
+        guard secondsRemaining > 0 else { return }
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            DispatchQueue.main.async {
+                if self.secondsRemaining > 0 { self.secondsRemaining -= 1 }
+                else { self.stopCountdown() }
+            }
+        }
+        if let t = countdownTimer { RunLoop.main.add(t, forMode: .common) }
+    }
+    private func stopCountdown() { countdownTimer?.invalidate(); countdownTimer = nil }
+}
+
+struct ProminentGreenButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+            .padding(.vertical, 8).padding(.horizontal, 12).frame(maxWidth: .infinity)
+            .background(configuration.isPressed ? Color.green.opacity(0.8) : Color.green)
+            .cornerRadius(8)
+    }
+}
+
+struct SecondaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12)).foregroundColor(.primary)
+            .padding(.vertical, 5).padding(.horizontal, 10)
+            .background(configuration.isPressed
+                ? Color(NSColor.controlBackgroundColor).opacity(0.7)
+                : Color(NSColor.controlBackgroundColor))
+            .cornerRadius(6)
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(NSColor.separatorColor), lineWidth: 0.5))
+    }
+}
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxW = proposal.width ?? 268; var x: CGFloat = 0; var y: CGFloat = 0; var rh: CGFloat = 0
+        for sv in subviews {
+            let sz = sv.sizeThatFits(.unspecified)
+            if x + sz.width > maxW, x > 0 { x = 0; y += rh + spacing; rh = 0 }
+            x += sz.width + spacing; rh = max(rh, sz.height)
+        }
+        return CGSize(width: maxW, height: y + rh)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX; var y = bounds.minY; var rh: CGFloat = 0
+        for sv in subviews {
+            let sz = sv.sizeThatFits(.unspecified)
+            if x + sz.width > bounds.maxX, x > bounds.minX { x = bounds.minX; y += rh + spacing; rh = 0 }
+            sv.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(sz))
+            x += sz.width + spacing; rh = max(rh, sz.height)
+        }
+    }
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
-    let stateFilePath = "/Library/Management/AppAutoPatch/menubar-state.json"
-    let cmdFilePath   = "/var/tmp/aap-menubar.cmd"
     var statusItem: NSStatusItem!
+    var popover: NSPopover!
     var pollTimer: Timer?
     var lastStateMtime: Date?
+    let appStateModel = AAPStateModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = false
-        loadAndRefreshUI()
+        if let button = statusItem.button {
+            button.action = #selector(togglePopover(_:))
+            button.target = self
+        }
+        popover = NSPopover()
+        popover.contentSize = NSSize(width: 300, height: 300)
+        popover.behavior = .transient
+        popover.contentViewController = NSHostingController(
+            rootView: AAPPopoverView(appState: appStateModel, onDismiss: { [weak self] in
+                self?.closePopover()
+            })
+        )
+        appStateModel.reload()
+        updateIcon()
         startPolling()
     }
 
@@ -2726,151 +2991,59 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func pollIfChanged() {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: stateFilePath)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: appStateModel.stateFilePath)
         let mtime = attrs?[.modificationDate] as? Date
         if mtime != lastStateMtime {
             lastStateMtime = mtime
-            loadAndRefreshUI()
+            appStateModel.reload()
+            DispatchQueue.main.async { self.updateIcon() }
         }
     }
 
-    func loadAndRefreshUI() {
-        guard
-            let data  = FileManager.default.contents(atPath: stateFilePath),
-            let state = try? JSONDecoder().decode(AAPState.self, from: data)
-        else {
-            DispatchQueue.main.async { [weak self] in self?.statusItem.isVisible = false }
-            return
-        }
-        DispatchQueue.main.async { [weak self] in self?.applyState(state) }
-    }
-
-    func applyState(_ state: AAPState) {
+    func updateIcon() {
         guard let button = statusItem.button else { return }
+        let state = appStateModel.state
         switch state.status {
         case "pending_updates":
-            let cfg   = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
-            let image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.circle.fill",
-                                accessibilityDescription: "App updates available")
-            button.image         = image?.withSymbolConfiguration(cfg)
+            let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.orange]))
+            button.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.circle.fill",
+                                   accessibilityDescription: "App updates available")?.withSymbolConfiguration(cfg)
             button.imagePosition = .imageLeading
-            button.title         = state.pendingUpdateCount > 0 ? " \(state.pendingUpdateCount)" : ""
+            button.title = state.pendingUpdateCount > 0 ? " \(state.pendingUpdateCount)" : ""
             statusItem.isVisible = true
-            rebuildMenu(state: state)
         case "hard_deadline":
-            let cfg   = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
-            let image = NSImage(systemSymbolName: "exclamationmark.circle.fill",
-                                accessibilityDescription: "Install required")
-            button.image         = image?.withSymbolConfiguration(cfg)
+            let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.red]))
+            button.image = NSImage(systemSymbolName: "exclamationmark.circle.fill",
+                                   accessibilityDescription: "Install required")?.withSymbolConfiguration(cfg)
             button.imagePosition = .imageLeading
-            button.title         = " Install required"
+            button.title = " Install required"
             statusItem.isVisible = true
-            rebuildMenu(state: state)
         case "patching_in_progress":
-            let cfg   = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
-            let image = NSImage(systemSymbolName: "gearshape.fill",
-                                accessibilityDescription: "Patching in progress")
-            button.image         = image?.withSymbolConfiguration(cfg)
+            let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.systemBlue]))
+            button.image = NSImage(systemSymbolName: "gearshape.fill",
+                                   accessibilityDescription: "Patching in progress")?.withSymbolConfiguration(cfg)
             button.imagePosition = .imageLeading
-            button.title         = " Patching\u{2026}"
+            button.title = " Patching\u{2026}"
             statusItem.isVisible = true
-            rebuildMenu(state: state)
         default:
             statusItem.isVisible = false
+            if popover.isShown { closePopover() }
         }
     }
 
-    func rebuildMenu(state: AAPState) {
-        let menu = NSMenu()
-        switch state.status {
-        case "pending_updates":
-            let count = state.pendingUpdateCount
-            let header = NSMenuItem(
-                title: "\(count) app update\(count == 1 ? "" : "s") available",
-                action: nil, keyEquivalent: "")
-            header.isEnabled = false
-            menu.addItem(header)
-            for app in state.pendingApps.prefix(6) {
-                let item = NSMenuItem(title: "  \u{2022} \(app)", action: nil, keyEquivalent: "")
-                item.isEnabled = false
-                menu.addItem(item)
-            }
-            if state.pendingApps.count > 6 {
-                let more = NSMenuItem(
-                    title: "  \u{2026} and \(state.pendingApps.count - 6) more",
-                    action: nil, keyEquivalent: "")
-                more.isEnabled = false
-                menu.addItem(more)
-            }
-            menu.addItem(.separator())
-            let installItem = NSMenuItem(
-                title: "Update Now", action: #selector(handleInstallNow), keyEquivalent: "")
-            installItem.target = self
-            menu.addItem(installItem)
-            menu.addItem(.separator())
-            let defer1h = NSMenuItem(
-                title: "Defer 1 Hour", action: #selector(handleDefer1Hour), keyEquivalent: "")
-            defer1h.target = self
-            menu.addItem(defer1h)
-            let deferDay = NSMenuItem(
-                title: "Defer Until Tomorrow", action: #selector(handleDeferTomorrow), keyEquivalent: "")
-            deferDay.target = self
-            menu.addItem(deferDay)
-        case "hard_deadline":
-            let count = state.pendingUpdateCount
-            let header = NSMenuItem(
-                title: "\(count) update\(count == 1 ? "" : "s") will install shortly",
-                action: nil, keyEquivalent: "")
-            header.isEnabled = false
-            menu.addItem(header)
-            for app in state.pendingApps.prefix(6) {
-                let item = NSMenuItem(title: "  \u{2022} \(app)", action: nil, keyEquivalent: "")
-                item.isEnabled = false
-                menu.addItem(item)
-            }
-            if state.pendingApps.count > 6 {
-                let more = NSMenuItem(
-                    title: "  \u{2026} and \(state.pendingApps.count - 6) more",
-                    action: nil, keyEquivalent: "")
-                more.isEnabled = false
-                menu.addItem(more)
-            }
-            menu.addItem(.separator())
-            let notice = NSMenuItem(
-                title: "No deferrals remaining \u{2014} install is automatic",
-                action: nil, keyEquivalent: "")
-            notice.isEnabled = false
-            menu.addItem(notice)
-        case "patching_in_progress":
-            let item = NSMenuItem(title: "Patching in progress\u{2026}", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        default:
-            let item = NSMenuItem(title: "All apps are up to date", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        }
-        if let lastPatched = state.lastPatchedDate, !lastPatched.isEmpty {
-            menu.addItem(.separator())
-            let lp = NSMenuItem(title: "Last patched: \(lastPatched)", action: nil, keyEquivalent: "")
-            lp.isEnabled = false
-            menu.addItem(lp)
-        }
-        if let nextRun = state.nextRunDate, !nextRun.isEmpty {
-            let nr = NSMenuItem(title: "Next run: \(nextRun)", action: nil, keyEquivalent: "")
-            nr.isEnabled = false
-            menu.addItem(nr)
-        }
-        statusItem.menu = menu
+    @objc func togglePopover(_ sender: Any?) {
+        if popover.isShown { closePopover() } else { openPopover() }
     }
-
-    func writeCommand(_ cmd: String) {
-        try? cmd.write(toFile: cmdFilePath, atomically: true, encoding: .utf8)
+    func openPopover() {
+        guard let button = statusItem.button else { return }
+        appStateModel.reload()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
     }
-
-    @objc func handleInstallNow()    { writeCommand("install_now");  statusItem.isVisible = false }
-    @objc func handleDefer1Hour()    { writeCommand("defer:60");      statusItem.isVisible = false }
-    @objc func handleDeferTomorrow() { writeCommand("defer:1440");    statusItem.isVisible = false }
+    func closePopover() { popover.performClose(nil) }
 }
 
 let app      = NSApplication.shared
@@ -2883,6 +3056,7 @@ SWIFT_SOURCE
     local compile_out
     compile_out=$("${swiftc_path}" \
         -framework Cocoa \
+        -framework SwiftUI \
         -o "${menubar_app_binary}" \
         "${swift_src}" 2>&1)
     local compile_exit=$?
@@ -3955,7 +4129,9 @@ write_menubar_state() {
   "pendingUpdateCount": ${count},
   "pendingApps": ${apps_json},
   "lastPatchedDate": "${last_patched}",
-  "nextRunDate": "${next_run}"
+  "nextRunDate": "${next_run}",
+  "stateUpdatedEpoch": $(date +%s),
+  "countdownSeconds": ${DialogTimeoutDeferral:-300}
 }
 JSON
 )
