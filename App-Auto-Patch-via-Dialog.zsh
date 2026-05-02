@@ -89,6 +89,9 @@ echo "
 
     Dialog Options
     [--dialog-icon-option=filepath|URL]
+
+    Menu Bar Options
+    [--menu-bar-mode] [--menu-bar-mode-off]
     
     Webhook Options:
     [--webhook-feature-all] [--webhook-feature-failures] [--webhook-feature-off]
@@ -277,6 +280,14 @@ set_defaults() {
     appAutoPatchManagedPLIST="/Library/Managed Preferences/xyz.techitout.appAutoPatch"
 
     appAutoPatchLaunchDaemonLabel="xyz.techitout.aap"
+
+    # Menu Bar Mode – persistent NSStatusItem companion app
+    MenuBarMode="FALSE" # MDM Enabled
+    menubar_app_binary="${appAutoPatchFolder}/AAPMenuBar"
+    menubar_state_file="${appAutoPatchFolder}/menubar-state.json"
+    menubar_cmd_file="/var/tmp/aap-menubar.cmd"
+    menubar_launch_agent_label="xyz.techitout.aap.menubar"
+    menubar_launch_agent_plist="/Library/LaunchAgents/${menubar_launch_agent_label}.plist"
 
     WORKFLOW_INSTALL_NOW_FILE="${appAutoPatchFolder}/.WorkflowInstallNow"
     
@@ -864,6 +875,12 @@ get_options() {
             --zoom-call-active-check-disabled)
                 zoom_call_active_check_option="FALSE"
             ;;
+            --menu-bar-mode)
+                MenuBarMode="TRUE"
+            ;;
+            --menu-bar-mode-off)
+                MenuBarMode="FALSE"
+            ;;
             *)
                 unrecognized_options_array+=("$1")
             ;;  
@@ -1054,7 +1071,9 @@ get_preferences() {
         version_comparison_installomator_fallback_managed=$(defaults read "${appAutoPatchManagedPLIST}" VersionComparisonInstallomatorFallback 2> /dev/null)
         local zoom_call_active_check_managed
         zoom_call_active_check_managed=$(defaults read "${appAutoPatchManagedPLIST}" ZoomCallActiveCheck 2> /dev/null)
-        
+        local menu_bar_mode_managed
+        menu_bar_mode_managed=$(defaults read "${appAutoPatchManagedPLIST}" MenuBarMode 2> /dev/null)
+
     else
         log_verbose "No managed preference file found for App Auto-Patch"
     fi
@@ -1219,6 +1238,8 @@ get_preferences() {
 
     [[ -n "${zoom_call_active_check_managed}" ]] && zoom_call_active_check_option="${zoom_call_active_check_managed}"
     { [[ -z "${zoom_call_active_check_managed}" ]] && [[ -z "${zoom_call_active_check_option}" ]] && [[ -n "${zoom_call_active_check_local}" ]]; } && zoom_call_active_check_option="${zoom_call_active_check_local}"
+
+    [[ -n "${menu_bar_mode_managed}" ]] && MenuBarMode="${menu_bar_mode_managed}"
 
     # Need logic to ensures the priority order of managed preference overrides the saved local preference which overrides the script embedded variables .
     [[ -n "${app_title_managed}" ]] && appTitle="${app_title_managed}"
@@ -2059,6 +2080,12 @@ workflow_startup() {
 	log_aap "**** App Auto-Patch ${scriptVersion} - AAP STARTUP WORKFLOW ****"
 	write_status "Running: Startup workflow."
 
+    # Reset any stale menu bar state from a previous run so the icon stays hidden
+    # until discovery is complete and updates are confirmed.
+    if [[ "${MenuBarMode}" == "TRUE" ]] && [[ -f "${menubar_state_file}" ]]; then
+        write_menubar_state "idle" "0" ""
+    fi
+
     get_logged_in_user
     # Computer stats here
     log_info "Computer Serial: $serialNumber"
@@ -2638,6 +2665,451 @@ EOLD
         log_install "ERROR: App Auto Patch failed to install correctly... Try pre-loading the script to a local temporary folder and executing the script from there to install properly"
         option_error="TRUE"
     fi
+
+    # Optionally install the Menu Bar companion app
+    if [[ "${MenuBarMode}" == "TRUE" ]]; then
+        install_menubar_app
+    fi
+}
+
+# install_menubar_app
+# Compiles AAPMenuBar.swift (requires Xcode Command Line Tools) and installs it
+# as a per-user LaunchAgent so the menu bar icon persists across logins.
+install_menubar_app() {
+    log_install "MenuBar: installing companion app..."
+
+    local swiftc_path
+    swiftc_path=$(xcrun --find swiftc 2>/dev/null)
+    if [[ -z "${swiftc_path}" ]]; then
+        log_warning "MenuBar: swiftc not found – install Xcode Command Line Tools to enable menu bar mode"
+        return
+    fi
+
+    # Write Swift source to a temp file, compiled to the management folder.
+    local swift_src
+    swift_src=$(mktemp /private/tmp/AAPMenuBar.XXXXXX.swift)
+
+    # ── Swift source embedded here – keep in sync with AAPMenuBar/AAPMenuBar.swift ──
+    /bin/cat > "${swift_src}" << 'SWIFT_SOURCE'
+// AAPMenuBar.swift – embedded build copy; edit AAPMenuBar/AAPMenuBar.swift in the repo
+import Cocoa
+import SwiftUI
+
+struct AAPState: Codable {
+    var status: String
+    var pendingUpdateCount: Int
+    var pendingApps: [String]
+    var lastPatchedDate: String?
+    var nextRunDate: String?
+    var stateUpdatedEpoch: TimeInterval?
+    var countdownSeconds: Int?
+}
+
+class AAPStateModel: ObservableObject {
+    let stateFilePath = "/Library/Management/AppAutoPatch/menubar-state.json"
+    let cmdFilePath   = "/var/tmp/aap-menubar.cmd"
+    @Published var state: AAPState = AAPState(
+        status: "idle", pendingUpdateCount: 0, pendingApps: [],
+        lastPatchedDate: nil, nextRunDate: nil,
+        stateUpdatedEpoch: nil, countdownSeconds: nil)
+    func reload() {
+        guard let data = FileManager.default.contents(atPath: stateFilePath),
+              let loaded = try? JSONDecoder().decode(AAPState.self, from: data) else { return }
+        DispatchQueue.main.async { self.state = loaded }
+    }
+    func writeCommand(_ cmd: String) {
+        try? cmd.write(toFile: cmdFilePath, atomically: true, encoding: .utf8)
+    }
+}
+
+struct AAPPopoverView: View {
+    @ObservedObject var appState: AAPStateModel
+    var onDismiss: () -> Void
+    @State private var secondsRemaining: Int = 0
+    @State private var countdownTimer: Timer? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            headerSection
+            if !appState.state.pendingApps.isEmpty { appListSection }
+            Divider().padding(.vertical, 8)
+            actionSection
+            Divider().padding(.vertical, 8)
+            footerSection
+        }
+        .padding(16)
+        .frame(width: 300)
+        .onAppear { appState.reload(); startCountdownIfNeeded() }
+        .onDisappear { stopCountdown() }
+    }
+
+    @ViewBuilder
+    private var headerSection: some View {
+        HStack(spacing: 10) {
+            Image(systemName: headerIconName)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundColor(headerIconColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headerTitle).font(.system(size: 14, weight: .semibold))
+                if !headerSubtitle.isEmpty {
+                    Text(headerSubtitle).font(.system(size: 11)).foregroundColor(.secondary)
+                }
+            }
+            Spacer()
+        }
+        .padding(.bottom, 10)
+    }
+
+    private var headerIconName: String {
+        switch appState.state.status {
+        case "hard_deadline":        return "exclamationmark.circle.fill"
+        case "patching_in_progress": return "gearshape.fill"
+        case "up_to_date":           return "checkmark.circle.fill"
+        default:                     return "arrow.triangle.2.circlepath.circle.fill"
+        }
+    }
+    private var headerIconColor: Color {
+        switch appState.state.status {
+        case "hard_deadline":        return .red
+        case "patching_in_progress": return .blue
+        case "up_to_date":           return .green
+        default:                     return .orange
+        }
+    }
+    private var headerTitle: String {
+        let n = appState.state.pendingUpdateCount
+        switch appState.state.status {
+        case "hard_deadline":        return "\(n) update\(n == 1 ? "" : "s") will install soon"
+        case "patching_in_progress": return "Patching in progress\u{2026}"
+        case "up_to_date":           return "All apps are up to date"
+        default:                     return "\(n) app update\(n == 1 ? "" : "s") available"
+        }
+    }
+    private var headerSubtitle: String {
+        switch appState.state.status {
+        case "hard_deadline":        return "Maximum deferrals reached"
+        case "patching_in_progress": return "Please don\u{2019}t restart your Mac"
+        default:                     return ""
+        }
+    }
+
+    @ViewBuilder
+    private var appListSection: some View {
+        let apps = appState.state.pendingApps
+        let displayed = Array(apps.prefix(8))
+        let overflow  = apps.count - displayed.count
+        VStack(alignment: .leading, spacing: 4) {
+            FlowLayout(spacing: 6) {
+                ForEach(displayed, id: \.self) { app in
+                    Text(app)
+                        .font(.system(size: 11))
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(5)
+                        .overlay(RoundedRectangle(cornerRadius: 5)
+                            .stroke(Color(NSColor.separatorColor), lineWidth: 0.5))
+                }
+            }
+            if overflow > 0 {
+                Text("\u{2026} and \(overflow) more")
+                    .font(.system(size: 11)).foregroundColor(.secondary).padding(.top, 2)
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    @ViewBuilder
+    private var actionSection: some View {
+        switch appState.state.status {
+        case "hard_deadline":        hardDeadlineActions
+        case "patching_in_progress": patchingActions
+        default:                     normalActions
+        }
+    }
+
+    @ViewBuilder
+    private var normalActions: some View {
+        Button(action: { appState.writeCommand("install_now"); onDismiss() }) {
+            HStack {
+                Image(systemName: "arrow.down.circle.fill")
+                Text("Update Now").fontWeight(.semibold)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(ProminentGreenButtonStyle())
+        .padding(.bottom, 8)
+        HStack(spacing: 8) {
+            Text("Defer:").font(.system(size: 12)).foregroundColor(.secondary)
+            Button("1 Hour")         { appState.writeCommand("defer:60");   onDismiss() }
+                .buttonStyle(SecondaryButtonStyle())
+            Button("Until Tomorrow") { appState.writeCommand("defer:1440"); onDismiss() }
+                .buttonStyle(SecondaryButtonStyle())
+        }
+    }
+
+    @ViewBuilder
+    private var hardDeadlineActions: some View {
+        HStack {
+            Image(systemName: "timer").foregroundColor(.red)
+            Text(secondsRemaining > 0
+                 ? "Installing in \(formattedCountdown)\u{2026}"
+                 : "Installing now\u{2026}")
+                .font(.system(size: 13, weight: .medium)).foregroundColor(.red)
+            Spacer()
+        }
+        .padding(.vertical, 4)
+        Text("No deferrals remaining. Installation will begin automatically.")
+            .font(.system(size: 11)).foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private var patchingActions: some View {
+        HStack {
+            ProgressView().scaleEffect(0.7).padding(.trailing, 4)
+            Text("Installation in progress\u{2026}")
+                .font(.system(size: 12)).foregroundColor(.secondary)
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    private var footerSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let v = appState.state.lastPatchedDate, !v.isEmpty { footerRow("Last patched:", v) }
+            if let v = appState.state.nextRunDate,     !v.isEmpty { footerRow("Next run:",     v) }
+        }
+    }
+    private func footerRow(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 4) {
+            Text(label).font(.system(size: 11)).foregroundColor(.secondary).frame(width: 90, alignment: .leading)
+            Text(value).font(.system(size: 11))
+        }
+    }
+
+    private var formattedCountdown: String {
+        let m = secondsRemaining / 60; let s = secondsRemaining % 60
+        return m > 0 ? String(format: "%d:%02d", m, s) : "\(s)s"
+    }
+    private func startCountdownIfNeeded() {
+        stopCountdown()
+        guard appState.state.status == "hard_deadline",
+              let epoch = appState.state.stateUpdatedEpoch,
+              let total = appState.state.countdownSeconds else { return }
+        let remaining = Int(epoch + Double(total) - Date().timeIntervalSince1970)
+        secondsRemaining = max(remaining, 0)
+        guard secondsRemaining > 0 else { return }
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            DispatchQueue.main.async {
+                if self.secondsRemaining > 0 { self.secondsRemaining -= 1 }
+                else { self.stopCountdown() }
+            }
+        }
+        if let t = countdownTimer { RunLoop.main.add(t, forMode: .common) }
+    }
+    private func stopCountdown() { countdownTimer?.invalidate(); countdownTimer = nil }
+}
+
+struct ProminentGreenButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+            .padding(.vertical, 8).padding(.horizontal, 12).frame(maxWidth: .infinity)
+            .background(configuration.isPressed ? Color.green.opacity(0.8) : Color.green)
+            .cornerRadius(8)
+    }
+}
+
+struct SecondaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12)).foregroundColor(.primary)
+            .padding(.vertical, 5).padding(.horizontal, 10)
+            .background(configuration.isPressed
+                ? Color(NSColor.controlBackgroundColor).opacity(0.7)
+                : Color(NSColor.controlBackgroundColor))
+            .cornerRadius(6)
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(NSColor.separatorColor), lineWidth: 0.5))
+    }
+}
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxW = proposal.width ?? 268; var x: CGFloat = 0; var y: CGFloat = 0; var rh: CGFloat = 0
+        for sv in subviews {
+            let sz = sv.sizeThatFits(.unspecified)
+            if x + sz.width > maxW, x > 0 { x = 0; y += rh + spacing; rh = 0 }
+            x += sz.width + spacing; rh = max(rh, sz.height)
+        }
+        return CGSize(width: maxW, height: y + rh)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX; var y = bounds.minY; var rh: CGFloat = 0
+        for sv in subviews {
+            let sz = sv.sizeThatFits(.unspecified)
+            if x + sz.width > bounds.maxX, x > bounds.minX { x = bounds.minX; y += rh + spacing; rh = 0 }
+            sv.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(sz))
+            x += sz.width + spacing; rh = max(rh, sz.height)
+        }
+    }
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    var statusItem: NSStatusItem!
+    var popover: NSPopover!
+    var pollTimer: Timer?
+    var lastStateMtime: Date?
+    let appStateModel = AAPStateModel()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.isVisible = false
+        if let button = statusItem.button {
+            button.action = #selector(togglePopover(_:))
+            button.target = self
+        }
+        popover = NSPopover()
+        popover.contentSize = NSSize(width: 300, height: 300)
+        popover.behavior = .transient
+        popover.contentViewController = NSHostingController(
+            rootView: AAPPopoverView(appState: appStateModel, onDismiss: { [weak self] in
+                self?.closePopover()
+            })
+        )
+        appStateModel.reload()
+        updateIcon()
+        startPolling()
+    }
+
+    func startPolling() {
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            self?.pollIfChanged()
+        }
+        RunLoop.main.add(pollTimer!, forMode: .common)
+    }
+
+    func pollIfChanged() {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: appStateModel.stateFilePath)
+        let mtime = attrs?[.modificationDate] as? Date
+        if mtime != lastStateMtime {
+            lastStateMtime = mtime
+            appStateModel.reload()
+            DispatchQueue.main.async { self.updateIcon() }
+        }
+    }
+
+    func updateIcon() {
+        guard let button = statusItem.button else { return }
+        let state = appStateModel.state
+        switch state.status {
+        case "pending_updates":
+            let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.orange]))
+            button.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.circle.fill",
+                                   accessibilityDescription: "App updates available")?.withSymbolConfiguration(cfg)
+            button.imagePosition = .imageLeading
+            button.title = state.pendingUpdateCount > 0 ? " \(state.pendingUpdateCount)" : ""
+            statusItem.isVisible = true
+        case "hard_deadline":
+            let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.red]))
+            button.image = NSImage(systemSymbolName: "exclamationmark.circle.fill",
+                                   accessibilityDescription: "Install required")?.withSymbolConfiguration(cfg)
+            button.imagePosition = .imageLeading
+            button.title = " Install required"
+            statusItem.isVisible = true
+        case "patching_in_progress":
+            let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.systemBlue]))
+            button.image = NSImage(systemSymbolName: "gearshape.fill",
+                                   accessibilityDescription: "Patching in progress")?.withSymbolConfiguration(cfg)
+            button.imagePosition = .imageLeading
+            button.title = " Patching\u{2026}"
+            statusItem.isVisible = true
+        default:
+            statusItem.isVisible = false
+            if popover.isShown { closePopover() }
+        }
+    }
+
+    @objc func togglePopover(_ sender: Any?) {
+        if popover.isShown { closePopover() } else { openPopover() }
+    }
+    func openPopover() {
+        guard let button = statusItem.button else { return }
+        appStateModel.reload()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    func closePopover() { popover.performClose(nil) }
+}
+
+let app      = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
+SWIFT_SOURCE
+
+    log_install "MenuBar: compiling Swift source with ${swiftc_path}..."
+    local compile_out
+    compile_out=$("${swiftc_path}" \
+        -framework Cocoa \
+        -framework SwiftUI \
+        -o "${menubar_app_binary}" \
+        "${swift_src}" 2>&1)
+    local compile_exit=$?
+    rm -f "${swift_src}"
+
+    if [[ ${compile_exit} -ne 0 ]]; then
+        log_warning "MenuBar: compilation failed (exit ${compile_exit}): ${compile_out}"
+        log_warning "MenuBar: menu bar mode is enabled but companion app could not be built"
+        return
+    fi
+
+    chown root:wheel "${menubar_app_binary}"
+    chmod 755 "${menubar_app_binary}"
+    log_install "MenuBar: companion binary installed to ${menubar_app_binary}"
+
+    # ── LaunchAgent (runs as logged-in user) ──
+    log_install "MenuBar: creating LaunchAgent ${menubar_launch_agent_plist}"
+/bin/cat > "${menubar_launch_agent_plist}" << EOLA
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${menubar_launch_agent_label}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>${menubar_app_binary}</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+</dict>
+</plist>
+EOLA
+
+    chown root:wheel "${menubar_launch_agent_plist}"
+    chmod 644 "${menubar_launch_agent_plist}"
+
+    # Load for the currently logged-in user if someone is at the console.
+    # Use scutil (official Apple API) rather than the deprecated stat /dev/console approach.
+    local console_user uid
+    console_user=$(scutil <<< "show State:/Users/ConsoleUser" \
+        | awk '/Name :/ && !/loginwindow/ { print $3 }')
+    uid=$(id -u "${console_user}" 2>/dev/null)
+    if [[ -n "${uid}" && "${uid}" != "0" ]]; then
+        launchctl bootout "gui/${uid}/${menubar_launch_agent_label}" 2>/dev/null || true
+        launchctl bootstrap "gui/${uid}" "${menubar_launch_agent_plist}" 2>/dev/null && \
+            log_install "MenuBar: LaunchAgent loaded for ${console_user} (uid ${uid})" || \
+            log_warning "MenuBar: could not load LaunchAgent for ${console_user}"
+    fi
 }
 
 function uninstall_app_auto_patch() {
@@ -2657,11 +3129,25 @@ function uninstall_app_auto_patch() {
     launchctl bootout system "/Library/LaunchDaemons/${appAutoPatchLaunchDaemonLabel}.plist" 2> /dev/null
     rm -f "/Library/LaunchDaemons/${appAutoPatchLaunchDaemonLabel}.plist" 2> /dev/null
 
+    # Remove menu bar companion LaunchAgent and binary (if installed)
+    if [[ -f "${menubar_launch_agent_plist}" ]]; then
+        log_uninstall "MenuBar: removing LaunchAgent ${menubar_launch_agent_plist}"
+        local console_user uid
+        console_user=$(scutil <<< "show State:/Users/ConsoleUser" \
+            | awk '/Name :/ && !/loginwindow/ { print $3 }')
+        uid=$(id -u "${console_user}" 2>/dev/null)
+        [[ -n "${uid}" && "${uid}" != "0" ]] && \
+            launchctl bootout "gui/${uid}/${menubar_launch_agent_label}" 2>/dev/null || true
+        pkill -x "AAPMenuBar" 2>/dev/null || true
+        rm -f "${menubar_launch_agent_plist}"
+    fi
+    rm -f "${menubar_state_file}" "${menubar_cmd_file}" 2>/dev/null || true
+
     # Remove the App Auto Patch sym link
     log_uninstall "Removing ${appAutoPatchLink}"
     rm -rf ${appAutoPatchLink}
 
-    # Remove the App Auto Patch Folder
+    # Remove the App Auto Patch Folder (includes AAPMenuBar binary)
     log_uninstall "Removing ${appAutoPatchFolder}"
     rm -rf ${appAutoPatchFolder}
 
@@ -3596,10 +4082,156 @@ swiftDialogCompleteDialogDiscover(){
 }
 
 swiftDialogUpdate(){
-    
-    log_verbose "Update swiftDialog: $1" 
+
+    log_verbose "Update swiftDialog: $1"
     echo "$1" >> "$dialogCommandFile"
-    
+
+}
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Menu Bar Mode helpers
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+# write_menubar_state STATUS COUNT APP_NAMES_NEWLINE_SEPARATED
+# Writes a JSON state file for the AAPMenuBar companion app to read.
+write_menubar_state() {
+    local status="${1:-idle}"
+    local count="${2:-0}"
+    local apps_raw="${3:-}"
+    local last_patched next_run
+
+    last_patched=$(defaults read "${appAutoPatchLocalPLIST}" AAPPatchingCompleteDate 2>/dev/null | \
+        awk '{print $1,$2,$3}')  # "Yyyy-MM-dd HH:MM:SS"
+
+    next_run=$(defaults read "${appAutoPatchLocalPLIST}" NextAutoLaunch 2>/dev/null | \
+        awk '{print $1,$2,$3}')
+
+    # Build a JSON array of app names from newline-separated input.
+    local apps_json="[]"
+    if [[ -n "${apps_raw}" ]]; then
+        apps_json="["
+        local first=1
+        while IFS= read -r app; do
+            [[ -z "${app}" ]] && continue
+            # Escape double-quotes
+            app="${app//\"/\\\"}"
+            [[ ${first} -eq 0 ]] && apps_json+=","
+            apps_json+="\"${app}\""
+            first=0
+        done <<< "${apps_raw}"
+        apps_json+="]"
+    fi
+
+    local json
+    json=$(cat <<JSON
+{
+  "status": "${status}",
+  "pendingUpdateCount": ${count},
+  "pendingApps": ${apps_json},
+  "lastPatchedDate": "${last_patched}",
+  "nextRunDate": "${next_run}",
+  "stateUpdatedEpoch": $(date +%s),
+  "countdownSeconds": ${DialogTimeoutDeferral:-300}
+}
+JSON
+)
+
+    printf '%s\n' "${json}" > "${menubar_state_file}"
+    chmod 644 "${menubar_state_file}"
+    log_info "MenuBar: wrote state '${status}' (${count} update(s)) to ${menubar_state_file}"
+}
+
+# launch_menubar_app
+# Ensures the AAPMenuBar companion binary is running for the current console user.
+launch_menubar_app() {
+    if [[ ! -f "${menubar_app_binary}" ]]; then
+        log_warning "MenuBar: companion binary not found at ${menubar_app_binary} – skipping launch"
+        return
+    fi
+
+    # currentUserAccountName is set by get_logged_in_user() which runs before this
+    # function is ever called (it is only invoked from main(), after workflow_startup()).
+    local console_user="${currentUserAccountName}"
+    [[ -z "${console_user}" || "${console_user}" == "FALSE" ]] && return
+    local uid
+    uid=$(id -u "${console_user}" 2>/dev/null)
+    [[ -z "${uid}" || "${uid}" == "0" ]] && return
+
+    if pgrep -x "AAPMenuBar" > /dev/null 2>&1; then
+        log_info "MenuBar: companion app already running"
+        return
+    fi
+
+    log_info "MenuBar: launching companion app for ${console_user} (uid ${uid})"
+    # Prefer kickstarting the installed LaunchAgent (it's already loaded after install).
+    # Fall back to a direct spawn if the LaunchAgent isn't loaded yet (unsupported path).
+    if launchctl kickstart -k "gui/${uid}/${menubar_launch_agent_label}" 2>/dev/null; then
+        log_info "MenuBar: LaunchAgent kickstarted successfully"
+    else
+        log_warning "MenuBar: LaunchAgent not yet loaded; using launchctl asuser as fallback (unsupported by Apple – ensure LaunchAgent plist is installed for reliable operation)"
+        launchctl asuser "${uid}" "${menubar_app_binary}" &
+        disown
+    fi
+    sleep 1
+}
+
+# wait_for_menubar_command
+# Polls the command file written by AAPMenuBar for up to DialogTimeoutDeferral
+# seconds (default 300 s).  Sets dialog_user_choice_install and/or
+# deferral_timer_minutes and returns.
+wait_for_menubar_command() {
+    local timeout="${DialogTimeoutDeferral:-300}"
+    local elapsed=0
+    local poll_interval=10
+
+    rm -f "${menubar_cmd_file}"
+    # Pre-create the file so the menu bar app (running as user) can write to it.
+    touch "${menubar_cmd_file}"
+    chmod 666 "${menubar_cmd_file}"
+
+    log_info "MenuBar: waiting up to ${timeout}s for user command via ${menubar_cmd_file}"
+
+    while [[ ${elapsed} -lt ${timeout} ]]; do
+        sleep ${poll_interval}
+        elapsed=$(( elapsed + poll_interval ))
+
+        local cmd
+        cmd=$(cat "${menubar_cmd_file}" 2>/dev/null | tr -d '[:space:]')
+
+        if [[ -n "${cmd}" ]]; then
+            rm -f "${menubar_cmd_file}"
+            case "${cmd}" in
+                install_now)
+                    log_status "MenuBar: user chose Install Now"
+                    write_status "Pending: User chose Install Now from menu bar"
+                    dialog_user_choice_install="TRUE"
+                    return
+                    ;;
+                defer:*)
+                    local mins="${cmd#defer:}"
+                    if [[ "${mins}" =~ ${REGEX_ANY_WHOLE_NUMBER} ]]; then
+                        deferral_timer_minutes="${mins}"
+                    fi
+                    log_status "MenuBar: user chose to defer for ${deferral_timer_minutes} minutes"
+                    write_status "Pending: User chose to defer update for ${deferral_timer_minutes} minutes via menu bar"
+                    dialog_user_choice_install="FALSE"
+                    return
+                    ;;
+            esac
+        fi
+    done
+
+    # Timeout – apply the configured default action.
+    rm -f "${menubar_cmd_file}"
+    local action
+    action=$(echo "${DialogTimeoutDeferralAction}" | tr '[:upper:]' '[:lower:]')
+    if [[ "${action}" == "install" ]]; then
+        log_status "MenuBar: timeout – proceeding with install (DialogTimeoutDeferralAction=${DialogTimeoutDeferralAction})"
+        dialog_user_choice_install="TRUE"
+    else
+        log_status "MenuBar: timeout – deferring (DialogTimeoutDeferralAction=${DialogTimeoutDeferralAction})"
+        dialog_user_choice_install="FALSE"
+    fi
 }
 
 set_deferral_menu() {
@@ -4172,18 +4804,24 @@ function queueLabel() {
 }
 
 workflow_do_Installations() {
-    
+
     # Check for blank installomatorOptions variable
     if [[ -z $installomatorOptions ]]; then
         log_verbose "Installomator options blank, setting to 'BLOCKING_PROCESS_ACTION=prompt_user NOTIFY=silent LOGO=appstore'"
         installomatorOptions="BLOCKING_PROCESS_ACTION=prompt_user NOTIFY=silent LOGO=appstore"
     fi
-    
+
     log_info "Installomator Options: $installomatorOptions"
-    
+
+    # Notify menu bar companion that patching is now in progress
+    if [[ "${MenuBarMode}" == "TRUE" ]]; then
+        write_menubar_state "patching_in_progress" "${numberOfUpdates:-0}" \
+            "$(printf '%b' "${menubar_display_names:-}")"
+    fi
+
     # Count errors
     errorCount=0
-    
+
     swiftDialogPatchingWindow # Create our main "list" swiftDialog Window
     
     if [ ${InteractiveModeOption} -ge 1 ]; then
@@ -4294,11 +4932,16 @@ workflow_do_Installations() {
     log_notice "Errors: $errorCount"
     
     swiftDialogCompleteDialogPatching # Close swiftdialog and delete the tmp file
-    
+
+    # Update menu bar state to reflect completion
+    if [[ "${MenuBarMode}" == "TRUE" ]]; then
+        write_menubar_state "up_to_date" "0" ""
+    fi
+
     remove_installomator
-    
-    log_info "Error Count $errorCount" 
-    
+
+    log_info "Error Count $errorCount"
+
 }
 
 check_and_echo_errors() {
@@ -5021,20 +5664,22 @@ main() {
     labelsArray=${labelsArray:|ignoredLabelsArray}
 
     appNamesArray=()
+    menubar_display_names=""   # newline-separated app names for write_menubar_state()
     # Get App Names for each label in labelsArray
     queuedLabelsForNames=("${(@s/ /)labelsArray}")
     for label in $queuedLabelsForNames; do
         log_verbose "Obtaining proper name for $label"
-        
+
         # Get display name from label fragment
         currentDisplay_name="$(awk -F\" '/^[[:space:]]*name=/{print $2; exit}' "$fragmentsPath/labels/$label.sh")"
-        
+
         # Resolve the icon path using helper function (handles targetDir for non-traditional paths)
         iconPath=$(resolve_app_icon_path "$label")
         log_verbose "Resolved icon path: $iconPath"
 
         appNamesArray+=("--listitem")
         appNamesArray+=(${currentDisplay_name},icon="${iconPath}")
+        [[ -n "${currentDisplay_name}" ]] && menubar_display_names+="${currentDisplay_name}\n"
     done
 
     log_notice "Labels to install: $labelsArray"
@@ -5063,6 +5708,12 @@ main() {
             rm -f "${WORKFLOW_INSTALL_NOW_FILE}" 2> /dev/null
             rm -f "${WORKFLOW_INSTALL_NOW_SILENT_FILE}" 2> /dev/null
             log_info "Install Now Workflow or Silent Mode active - Bypassing deferral workflow"
+            # Inform the menu bar companion that patching is starting immediately
+            if [[ "${MenuBarMode}" == "TRUE" ]]; then
+                write_menubar_state "patching_in_progress" "${numberOfUpdates}" \
+                    "$(printf '%b' "${menubar_display_names}")"
+                launch_menubar_app
+            fi
             log_notice "Passing ${numberOfUpdates} labels to Installomator: $queuedLabelsArray"
             workflow_do_Installations
             
@@ -5106,7 +5757,18 @@ main() {
             
             if [[ "${deadline_days_status}" == "HARD" ]] || [[ "${deadline_count_status}" == "HARD" ]]; then # The Max number of deferrals have been used
                 log_notice "Max number of deferrals have been used, display dialog and countdown to install workflow"
-                dialog_install_hard_deadline
+                if [[ "${MenuBarMode}" == "TRUE" ]]; then
+                    # Show hard-deadline warning in the menu bar instead of a popup dialog.
+                    # The Swift companion will display a warning icon; we then sleep for the
+                    # same DialogTimeoutDeferral countdown before proceeding automatically.
+                    write_menubar_state "hard_deadline" "${numberOfUpdates}" \
+                        "$(printf '%b' "${menubar_display_names}")"
+                    launch_menubar_app
+                    log_info "MenuBar: hard deadline – waiting ${DialogTimeoutDeferral:-60}s countdown before auto-install"
+                    sleep "${DialogTimeoutDeferral:-60}"
+                else
+                    dialog_install_hard_deadline
+                fi
                 log_info "Passing ${numberOfUpdates} labels to Installomator: $queuedLabelsArray"
                 workflow_do_Installations
                 defaults write "${appAutoPatchLocalPLIST}" AAPPatchingCompletionStatus -bool true #Set completion status to true
@@ -5140,9 +5802,18 @@ main() {
                 deferral_timer_minutes="${deferral_timer_focus_minutes}"
                 write_status "Pending: Automatic user focus deferral, trying again in ${deferral_timer_minutes} minutes."
                 set_auto_launch_deferral
-            else # Display the deferral dialog
-                log_info "Display Deferral Dialog"
-                dialog_install_or_defer
+            else # Display the deferral dialog / menu bar prompt
+                if [[ "${MenuBarMode}" == "TRUE" ]]; then
+                    log_info "MenuBar: writing pending-updates state and waiting for user command"
+                    # Convert \n-escaped string back to real newlines for the function
+                    write_menubar_state "pending_updates" "${numberOfUpdates}" \
+                        "$(printf '%b' "${menubar_display_names}")"
+                    launch_menubar_app
+                    wait_for_menubar_command
+                else
+                    log_info "Display Deferral Dialog"
+                    dialog_install_or_defer
+                fi
                 
                 if [[ "${dialog_user_choice_install}" == "TRUE" ]]; then
                     log_notice "Passing ${numberOfUpdates} labels to Installomator: $queuedLabelsArray"
@@ -5185,7 +5856,12 @@ main() {
         defaults write "${appAutoPatchLocalPLIST}" AAPPatchingCompletionStatus -bool true #Set completion status to true
         timestamp="$(date +$timestamp_format)"
         defaults write "${appAutoPatchLocalPLIST}" AAPPatchingCompleteDate -date "$timestamp"
-        
+
+        # Update menu bar companion to hide the icon (nothing pending)
+        if [[ "${MenuBarMode}" == "TRUE" ]]; then
+            write_menubar_state "up_to_date" "0" ""
+        fi
+
         if [ ${InteractiveModeOption} -gt 1 ]; then
             $dialogBinary --title "$appTitle" --message "${display_string_uptodate_message}" --windowbuttons min --icon "${icon}" --overlayicon "$overlayicon" --moveable --position topright --timer 60 --quitkey k --button1text "${display_string_uptodate_button1}" --style "mini" --hidetimerbar
         fi
